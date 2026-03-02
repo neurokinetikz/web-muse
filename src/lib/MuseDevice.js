@@ -2,17 +2,16 @@ import { MuseCircularBuffer } from "./CircularBuffer";
 
 /**
  * An abstract base class for interfaces that connect to a Muse headband.
- * Subclasses can implement any of the following abstract methods:
- * - batteryData       - called when an event with battery data is received (use eventBatteryData to get it)
- * - accelerometerData - called when an event with accelerometer data is received (use eventAccelerometerData to get it)
- * - gyroscopeData     - called when an event with gyroscope data is received (use eventGyroscopeData to get it)
- * - controlData       - called when an event with control data is received (use eventControlData to get it)
- * - eegData           - called when an event with EEG data is received (use eventEegData to get it)
- * - ppgData           - called when an event with PPG data is received (use eventPpgData to get it)
- * - disconnected      - called when the Muse headband is disconnected
+ * Supports both legacy Muse devices (Muse 2016, Muse 2) and Muse S Athena.
  */
 export class MuseBase {
-  #SERVICE = 0xfe8d;
+  // Legacy Muse service UUID (Muse 2016, Muse 2)
+  #LEGACY_SERVICE = 0xfe8d;
+  // 221e Muse v3 Custom Service — also used by Interaxon Muse S Athena which
+  // embeds a 221e IMU module.  Interaxon EEG characteristics (273e-...) and
+  // 221e IMU characteristics (CMD/DATA) both live under this service.
+  #MUSE_S_SERVICE = "c8c0a708-e361-4b5e-a365-98fa6b0a836f";
+  
   #CONTROL_CHARACTERISTIC = "273e0001-4c4d-454d-96be-f03bac821358";
   #BATTERY_CHARACTERISTIC = "273e000b-4c4d-454d-96be-f03bac821358";
   #GYROSCOPE_CHARACTERISTIC = "273e0009-4c4d-454d-96be-f03bac821358";
@@ -20,25 +19,33 @@ export class MuseBase {
   #PPG1_CHARACTERISTIC = "273e000f-4c4d-454d-96be-f03bac821358";
   #PPG2_CHARACTERISTIC = "273e0010-4c4d-454d-96be-f03bac821358";
   #PPG3_CHARACTERISTIC = "273e0011-4c4d-454d-96be-f03bac821358";
+  
+  // Legacy Muse EEG characteristics (Muse 2016, Muse 2)
   #EEG1_CHARACTERISTIC = "273e0003-4c4d-454d-96be-f03bac821358";
   #EEG2_CHARACTERISTIC = "273e0004-4c4d-454d-96be-f03bac821358";
   #EEG3_CHARACTERISTIC = "273e0005-4c4d-454d-96be-f03bac821358";
   #EEG4_CHARACTERISTIC = "273e0006-4c4d-454d-96be-f03bac821358";
   #EEG5_CHARACTERISTIC = "273e0007-4c4d-454d-96be-f03bac821358";
+  
+  // Muse S Athena EEG characteristics (new multiplexed format)
+  #ATHENA_EEG1_CHARACTERISTIC = "273e0013-4c4d-454d-96be-f03bac821358";
+  #ATHENA_EEG2_CHARACTERISTIC = "273e0014-4c4d-454d-96be-f03bac821358";
+  #ATHENA_EEG3_CHARACTERISTIC = "273e0015-4c4d-454d-96be-f03bac821358";
+  
+  // 221e Muse v3 TLV protocol characteristics — these stream IMU sensor data
+  // (accelerometer, gyroscope, magnetometer) using binary Type-Length-Value
+  // encoding per the 221e protocol spec (docs.221e.com).  NOT EEG data.
+  // Kept for diagnostic/reference but not routed to EEG parsers.
+  #V3_CMD_CHARACTERISTIC = "d5913036-2d8a-41ee-85b9-4e361aa5c8a7";
+  #V3_DATA_CHARACTERISTIC = "09bf2c52-d1d9-c0b7-4145-475964544307";
+  
   #state = 0;
   #dev = null;
   #controlChar = null;
   #infoFragment = "";
+  #activeService = null;
+  #isAthena = false;
 
-  /**
-   * Constructs a new interface for connecting to a Muse headband.
-   *
-   * @abstract
-   * @constructor
-   * @param {Object} options - Configuration options
-   * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
-   * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
-   */
   constructor(options = {}) {
     if (new.target === MuseBase) {
       throw new TypeError("Cannot construct MuseBase instances directly");
@@ -52,90 +59,31 @@ export class MuseBase {
     this.mockData = null;
   }
 
-  /**
-   * The current state of the headband.
-   *
-   * @type {number} 0 if disconnected, 1 if in the process of connecting, or 2 if connected.
-   */
   get state() {
     return this.#state;
   }
 
-  /**
-   * Processes the battery level data from the given event.
-   *
-   * @abstract
-   * @param {Event} event - The event containing the battery data.
-   * @return {void} This function does not return a value.
-   */
-  batteryData(event) {}
-  /**
-   * Processes the accelerometer data from the given event.
-   *
-   * @abstract
-   * @param {Event} event - The event containing the accelerometer data.
-   * @return {void} This function does not return a value.
-   */
-  accelerometerData(event) {}
-  /**
-   * Processes the gyroscope data from the given event.
-   *
-   * @abstract
-   * @param {Event} event - The event containing the gyroscope data.
-   * @return {void} This function does not return a value.
-   */
-  gyroscopeData(event) {}
-  /**
-   * A function that processes control data from the given event.
-   *
-   * @abstract
-   * @param {Event} event - The event containing the control data.
-   * @return {void} This function does not return a value.
-   */
-  controlData(event) {}
-  /**
-   * Processes EEG data from the given event.
-   *
-   * @abstract
-   * @param {number} n - The index of the EEG channel.
-   * @param {Event} event - The event containing the EEG data.
-   * @return {void} This function does not return a value.
-   */
-  eegData(n, event) {}
-  /**
-   * Processes PPG data from the given event.
-   *
-   * @abstract
-   * @param {number} n - The index of the PPG circular buffer to write to.
-   * @param {Event} event - The event containing the PPG data.
-   * @return {void} This function does not return a value.
-   */
-  ppgData(n, event) {}
-  /**
-   * A method that handles the disconnection event.
-   *
-   * @abstract
-   * @param {void} This function does not take any parameters.
-   * @return {void} This function does not return a value.
-   */
-  disconnected() {}
+  get modelName() {
+    if (this.#isAthena) {
+      return 'Muse Athena';
+    }
+    return 'Muse 2';
+  }
 
-  /**
-   * Decodes information from the given bytes array.
-   *
-   * @param {Uint8Array} bytes - The array of bytes containing information to decode.
-   * @return {string} The decoded information as a string.
-   */
+  batteryData(event) {}
+  accelerometerData(event) {}
+  gyroscopeData(event) {}
+  controlData(event) {}
+  eegData(n, event) {}
+  athenaEegData(n, event) {}
+  ppgData(n, event) {}
+  disconnected() {}
+  devicePicked(deviceName) {}
+
   #decodeInfo(bytes) {
     return new TextDecoder().decode(bytes.subarray(1, 1 + bytes[0]));
   }
 
-  /**
-   * Decodes unsigned 24-bit data from the given samples array.
-   *
-   * @param {Array} samples - The array of samples to decode.
-   * @return {Array} The decoded 24-bit data array.
-   */
   #decodeUnsigned24BitData(samples) {
     const samples24Bit = [];
     for (let i = 0; i < samples.length; i += 3) {
@@ -146,12 +94,6 @@ export class MuseBase {
     return samples24Bit;
   }
 
-  /**
-   * Decodes unsigned 12-bit data from the given samples array.
-   *
-   * @param {Array} samples - The array of samples to decode.
-   * @return {Array} The decoded 12-bit data array.
-   */
   #decodeUnsigned12BitData(samples) {
     const samples12Bit = [];
     for (let i = 0; i < samples.length; i++) {
@@ -165,38 +107,18 @@ export class MuseBase {
     return samples12Bit;
   }
 
-  /**
-   * Encodes a command by converting it to bytes and adding a length prefix.
-   *
-   * @param {string} cmd - The command to encode.
-   * @return {Uint8Array} The encoded command as bytes.
-   */
   #encodeCommand(cmd) {
     const encoded = new TextEncoder().encode(`X${cmd}\n`);
     encoded[0] = encoded.length - 1;
     return encoded;
   }
 
-  /**
-   * Returns the battery level from a given event.
-   *
-   * @param {object} event - The event containing the battery data.
-   * @return {number} A number between 0 and 100.
-   */
   eventBatteryData(event) {
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
     return data.getUint16(2) / 512;
   }
 
-  /**
-   * Returns an array of motion data based on the DataView, scale, and offset provided.
-   *
-   * @param {DataView} dv - The DataView containing the motion data.
-   * @param {number} scale - The scale factor to apply to the motion data.
-   * @param {number} ofs - The offset for accessing motion data within the DataView.
-   * @return {[number, number, number]} An triple of scaled motion data values.
-   */
   motionData(dv, scale, ofs) {
     return [
       scale * dv.getInt16(ofs),
@@ -205,15 +127,8 @@ export class MuseBase {
     ];
   }
 
-  /**
-   * Returns the accelerometer data from a given event.
-   *
-   * @param {object} event - The event containing the accelerometer data.
-   * @return {[number[], number[], number[]]} An triple of accelerometer sample arrays,
-   *                                          each sample a number between 0 and 1.
-   */
   eventAccelerometerData(event) {
-    const scale = 0.0000610352; // 1 / 2^14
+    const scale = 0.0000610352;
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
     let accelerometer = [[], [], []];
@@ -226,15 +141,8 @@ export class MuseBase {
     return accelerometer;
   }
 
-  /**
-   * Returns the gyroscope data from a given event.
-   *
-   * @param {object} event - The event containing the gyroscope data.
-   * @return {[number[], number[], number[]]} An triple of gyroscope sample arrays,
-   *                                          each sample a number between 0 and 1.
-   */
   eventGyroscopeData(event) {
-    const scale = 0.0074768; // 1 / 2^7
+    const scale = 0.0074768;
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
     let gyroscope = [[], [], []];
@@ -247,38 +155,35 @@ export class MuseBase {
     return gyroscope;
   }
 
-  /**
-   * Returns the control data from a given event.
-   *
-   * @param {object} event - The event containing the control data.
-   * @return {object} A dictionary of control data values.
-   */
   eventControlData(event) {
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
     const buf = new Uint8Array(data.buffer);
+    
+    // Log raw control data to understand Athena protocol
+    console.log("[web-muse] Control data:", Array.from(buf.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' '));
+    
     const str = this.#decodeInfo(buf);
     let info = {};
     for (let i = 0; i < str.length; i++) {
       const c = str[i];
       this.#infoFragment = this.#infoFragment + c;
       if (c === "}") {
-        const tmp = JSON.parse(this.#infoFragment);
-        this.#infoFragment = "";
-        for (const key in tmp) {
-          info[key] = tmp[key];
+        try {
+          const tmp = JSON.parse(this.#infoFragment);
+          this.#infoFragment = "";
+          for (const key in tmp) {
+            info[key] = tmp[key];
+          }
+        } catch (e) {
+          // Incomplete or malformed JSON fragment, continue accumulating
+          // This can happen with nested objects or Muse S Athena's different format
         }
       }
     }
     return info;
   }
 
-  /**
-   * Returns the EEG data from a given event.
-   *
-   * @param {object} event - The event containing the EEG data.
-   * @return {number[]} An array of samples, each a number between 0 and 2^12.
-   */
   eventEEGData(event) {
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
@@ -287,12 +192,6 @@ export class MuseBase {
     );
   }
 
-  /**
-   * Returns the PPG data from a given event.
-   *
-   * @param {object} event - The event containing the PPG data.
-   * @return {number[]} An array of samples, each a number between 0 and 2^24.
-   */
   eventPPGData(event) {
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
@@ -301,50 +200,31 @@ export class MuseBase {
     );
   }
 
-  /**
-   * Asynchronously sends a command to the control character.
-   *
-   * @param {string} cmd - The command to send.
-   * @return {Promise<void>} A promise that resolves when the command has been sent.
-   */
   async #sendCommand(cmd) {
-    await this.#controlChar["writeValue"](this.#encodeCommand(cmd));
+    if (this.#controlChar) {
+      await this.#controlChar["writeValue"](this.#encodeCommand(cmd));
+    }
   }
-  /**
-   * Pauses the operation by sending a command.
-   *
-   * @return {Promise<void>} A promise that resolves when the pause command is sent.
-   */
+
+  #sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   async #pause() {
     await this.#sendCommand("h");
   }
-  /**
-   * Resumes the operation by sending a command to the control character.
-   *
-   * @return {Promise<void>} A promise that resolves when the command to resume has been sent.
-   */
+
   async #resume() {
     await this.#sendCommand("d");
   }
-  /**
-   * Starts the process by pausing, sending a command to set the priority to 50,
-   * sending a command to start, and resuming.
-   *
-   * @return {Promise<void>} A promise that resolves when the process is started.
-   */
+
   async #start() {
     await this.#pause();
     await this.#sendCommand("p50");
     await this.#sendCommand("s");
     await this.#resume();
   }
-  /**
-   * Disconnects from the device by calling the `disconnect` method on the `gatt` object of the `dev` property.
-   * In mock mode, stops the data streaming.
-   * Sets the `dev` property to `null` and the `state` property to `0`.
-   *
-   * @return {void} This function does not return a value.
-   */
+
   disconnect() {
     if (this.mock) {
       this.#stopMockDataStream();
@@ -354,32 +234,28 @@ export class MuseBase {
     this.#state = 0;
     this.disconnected();
   }
-  /**
-   * Asynchronously connects to a characteristic in a BLE service and sets up a hook for characteristic value changes.
-   *
-   * @param {Object} service - The BLE service to connect to.
-   * @param {string} cid - The UUID of the characteristic to connect to.
-   * @param {Function} hook - The function to call when the characteristic value changes.
-   * @return {Promise<Object>} A promise that resolves to the connected characteristic.
-   */
-  async #connectChar(service, cid, hook) {
-    const c = await service["getCharacteristic"](cid);
-    c["oncharacteristicvaluechanged"] = hook;
-    c["startNotifications"]();
-    return c;
+
+  async #connectCharOptional(service, cid, hook) {
+    try {
+      const c = await service["getCharacteristic"](cid);
+      c["oncharacteristicvaluechanged"] = (event) => {
+        hook(event);
+      };
+      await c["startNotifications"]();
+      console.log(`[web-muse] Connected to characteristic ${cid}`);
+      return c;
+    } catch (e) {
+      console.log(`[web-muse] Characteristic ${cid} not available:`, e.message);
+      return null;
+    }
   }
-  /**
-   * Loads and parses the mock CSV data file.
-   *
-   * @return {Promise<Array>} A promise that resolves to parsed CSV data.
-   */
+
   async #loadMockData() {
     try {
       const response = await fetch(this.mockDataPath);
       const text = await response.text();
       const lines = text.trim().split("\n");
 
-      // Skip header line and parse CSV
       const data = [];
       for (let i = 1; i < lines.length; i++) {
         const values = lines[i].split(",");
@@ -387,10 +263,10 @@ export class MuseBase {
           data.push({
             timestamp: parseFloat(values[0]),
             eeg: [
-              parseFloat(values[1]), // TP9 (left ear)
-              parseFloat(values[2]), // AF7 (left forehead)
-              parseFloat(values[3]), // AF8 (right forehead)
-              parseFloat(values[4]), // TP10 (right ear)
+              parseFloat(values[1]),
+              parseFloat(values[2]),
+              parseFloat(values[3]),
+              parseFloat(values[4]),
             ],
           });
         }
@@ -402,11 +278,6 @@ export class MuseBase {
     }
   }
 
-  /**
-   * Starts the mock data streaming.
-   *
-   * @return {void}
-   */
   #startMockDataStream() {
     if (!this.mockData || this.mockData.length === 0) {
       console.error("No mock data available");
@@ -416,7 +287,6 @@ export class MuseBase {
     this.mockDataIndex = 0;
     const that = this;
 
-    // Function to feed the next data point
     const feedNextSample = () => {
       if (!that.mock || that.#state !== 2) {
         return;
@@ -426,17 +296,14 @@ export class MuseBase {
       const nextIndex = (that.mockDataIndex + 1) % that.mockData.length;
       const nextSample = that.mockData[nextIndex];
 
-      // Calculate delay to next sample based on timestamps
-      let delay = 4; // Default ~250Hz if timestamps are missing
+      let delay = 4;
       if (currentSample.timestamp && nextSample.timestamp) {
         delay = nextSample.timestamp - currentSample.timestamp;
-        // Wrap around case
         if (delay < 0) {
-          delay = 4; // Default delay when looping
+          delay = 4;
         }
       }
 
-      // Feed EEG data to each channel
       for (let i = 0; i < 4; i++) {
         const mockEvent = {
           target: {
@@ -446,40 +313,23 @@ export class MuseBase {
         that.eegData(i, mockEvent);
       }
 
-      // Move to next sample
       that.mockDataIndex = nextIndex;
-
-      // Schedule next sample
       that.mockInterval = setTimeout(feedNextSample, delay);
     };
 
-    // Start feeding data
     feedNextSample();
   }
 
-  /**
-   * Creates mock EEG data in the format expected by eventEEGData.
-   *
-   * @param {number} value - The EEG value to encode.
-   * @return {DataView} A DataView containing the mock EEG data.
-   */
   #createMockEEGData(value) {
-    // The eventEEGData method expects 12-bit unsigned data
-    // Convert from scaled value back to 12-bit: value = 0.48828125 * (x - 0x800)
-    // Therefore: x = (value / 0.48828125) + 0x800
     const unsigned12bit = Math.max(
       0,
       Math.min(0xfff, Math.round(value / 0.48828125 + 0x800))
     );
 
-    // Pack into bytes (12 samples = 18 bytes, we'll create 1 sample for simplicity)
-    // Format: each 12-bit sample takes 1.5 bytes
-    // For 12 samples: 18 bytes of data + 2 bytes header
     const buffer = new ArrayBuffer(20);
     const view = new DataView(buffer);
     const uint8 = new Uint8Array(buffer);
 
-    // Pack 12 identical samples (as the real device sends 12 samples per packet)
     for (let i = 0; i < 12; i++) {
       const byteOffset = 2 + Math.floor(i * 1.5);
       if (i % 2 === 0) {
@@ -496,11 +346,6 @@ export class MuseBase {
     return view;
   }
 
-  /**
-   * Stops the mock data streaming.
-   *
-   * @return {void}
-   */
   #stopMockDataStream() {
     if (this.mockInterval) {
       clearTimeout(this.mockInterval);
@@ -508,165 +353,281 @@ export class MuseBase {
     }
   }
 
-  /**
-   * Asynchronously connects to a BLE device and sets up characteristic value change hooks.
-   * In mock mode, loads pre-recorded data instead of connecting to a real device.
-   *
-   * @return {Promise<void>} A promise that resolves when the connection is established.
-   * @throws {Error} If the connection fails at any step.
-   */
   async connect() {
     if (this.#dev || this.#state !== 0) {
       return;
     }
     this.#state = 1;
 
-    // Mock mode: load CSV data and simulate streaming
+    // Mock mode
     if (this.mock) {
       try {
-        console.log("Connecting in mock mode...");
+        console.log("[web-muse] Connecting in mock mode...");
         this.mockData = await this.#loadMockData();
-        console.log(`Loaded ${this.mockData.length} samples from mock data`);
+        console.log(`[web-muse] Loaded ${this.mockData.length} samples from mock data`);
         this.#state = 2;
         this.#startMockDataStream();
         return;
       } catch (error) {
-        console.error("Failed to connect in mock mode:", error);
+        console.error("[web-muse] Failed to connect in mock mode:", error);
         this.#state = 0;
         throw error;
       }
     }
 
-    // Real device connection
+    // Real device connection - try multiple service UUIDs
+    console.log("[web-muse] Requesting Bluetooth device (supports Muse S Athena and legacy Muse)...");
+    
+    // V3 protocol service UUID (Muse S Gen2 / Athena)
+    const V3_SERVICE = "feed6b64-4cf5-11ee-be56-0242ac120002";
+    
     try {
-      this.#dev = await navigator["bluetooth"]["requestDevice"]({
-        filters: [{ services: [this.#SERVICE] }],
+      // Request device filtered by service UUIDs only - this ensures Chrome
+      // pre-authorizes the services and getPrimaryService() won't hang.
+      // DO NOT add namePrefix filter - it causes service discovery to hang
+      // because Chrome matches the device by name without authorizing any service.
+      this.#dev = await navigator.bluetooth.requestDevice({
+        filters: [
+          { services: [this.#LEGACY_SERVICE] },
+          { services: [this.#MUSE_S_SERVICE] },
+          { services: [V3_SERVICE] }
+        ],
+        optionalServices: [V3_SERVICE, this.#LEGACY_SERVICE, this.#MUSE_S_SERVICE]
       });
+      console.log("[web-muse] Device selected:", this.#dev.name);
+      this.devicePicked(this.#dev.name || 'Muse');
     } catch (error) {
+      console.error("[web-muse] requestDevice error:", error);
       this.#dev = null;
       this.#state = 0;
-      return;
+      throw error;
     }
-    let gatt = undefined;
+
+    let gatt;
     try {
-      gatt = await this.#dev["gatt"]["connect"]();
+      gatt = await this.#dev.gatt.connect();
+      console.log("[web-muse] GATT connected");
     } catch (error) {
+      console.error("[web-muse] GATT connect error:", error);
       this.#dev = null;
       this.#state = 0;
-      return;
+      throw error;
     }
-    const service = await gatt["getPrimaryService"](this.#SERVICE);
+
+    // Discover all available services on this device.
+    // A device matched by the V3 filter may also expose the Muse S or legacy
+    // service where the actual EEG/control characteristics live.
+    const availableServices = [];
+    const serviceLabels = [];
+    const serviceUUIDs = [
+      { uuid: this.#LEGACY_SERVICE, label: "legacy" },
+      { uuid: this.#MUSE_S_SERVICE, label: "Muse S" },
+      { uuid: V3_SERVICE, label: "V3" },
+    ];
+
+    console.log("[web-muse] Discovering available services...");
+    for (const { uuid, label } of serviceUUIDs) {
+      try {
+        const svc = await gatt.getPrimaryService(uuid);
+        availableServices.push(svc);
+        serviceLabels.push(label);
+        console.log(`[web-muse] Found ${label} service`);
+      } catch (e) {
+        // Service not available on this device
+      }
+    }
+
+    if (availableServices.length === 0) {
+      console.error("[web-muse] No compatible Muse service found");
+      this.#dev = null;
+      this.#state = 0;
+      throw new Error("No compatible Muse service found on device");
+    }
+
+    this.#activeService = serviceLabels[0];
+    console.log(`[web-muse] Available services: ${serviceLabels.join(", ")} — using ${serviceLabels[0]} as primary`);
+
     const that = this;
     this.#dev.addEventListener("gattserverdisconnected", function () {
-      this.#dev = null;
-      this.#state = 0;
+      that.#dev = null;
+      that.#state = 0;
       that.disconnected();
     });
-    this.#controlChar = await this.#connectChar(
-      service,
+
+    // Helper: try to connect a characteristic across all available services.
+    // Arrow function to preserve `this` for private field access.
+    const connectCharAcrossServices = async (charUUID, hook) => {
+      for (const svc of availableServices) {
+        const result = await this.#connectCharOptional(svc, charUUID, hook);
+        if (result) return result;
+      }
+      return null;
+    };
+
+    // Connect to characteristics - try each across all available services
+    this.#controlChar = await connectCharAcrossServices(
       this.#CONTROL_CHARACTERISTIC,
-      function (event) {
-        that.controlData(event);
-      }
+      (event) => that.controlData(event)
     );
-    await this.#connectChar(
-      service,
+
+    await connectCharAcrossServices(
       this.#BATTERY_CHARACTERISTIC,
-      function (event) {
-        that.batteryData(event);
-      }
+      (event) => that.batteryData(event)
     );
-    await this.#connectChar(
-      service,
+
+    await connectCharAcrossServices(
       this.#GYROSCOPE_CHARACTERISTIC,
-      function (event) {
-        that.gyroscopeData(event);
-      }
+      (event) => that.gyroscopeData(event)
     );
-    await this.#connectChar(
-      service,
+
+    await connectCharAcrossServices(
       this.#ACCELEROMETER_CHARACTERISTIC,
-      function (event) {
-        that.accelerometerData(event);
-      }
+      (event) => that.accelerometerData(event)
     );
-    await this.#connectChar(
-      service,
+
+    await connectCharAcrossServices(
       this.#PPG1_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(0, event);
-      }
+      (event) => that.ppgData(0, event)
     );
-    await this.#connectChar(
-      service,
+
+    await connectCharAcrossServices(
       this.#PPG2_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(1, event);
-      }
+      (event) => that.ppgData(1, event)
     );
-    await this.#connectChar(
-      service,
+
+    await connectCharAcrossServices(
       this.#PPG3_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(2, event);
-      }
+      (event) => that.ppgData(2, event)
     );
-    await this.#connectChar(
-      service,
-      this.#EEG1_CHARACTERISTIC,
-      function (event) {
-        that.eegData(0, event);
-      }
+
+    // Try Muse S Athena EEG characteristics first
+    const athenaChar1 = await connectCharAcrossServices(
+      this.#ATHENA_EEG1_CHARACTERISTIC,
+      (event) => that.athenaEegData(0, event)
     );
-    await this.#connectChar(
-      service,
-      this.#EEG2_CHARACTERISTIC,
-      function (event) {
-        that.eegData(1, event);
-      }
+    
+    const athenaChar2 = await connectCharAcrossServices(
+      this.#ATHENA_EEG2_CHARACTERISTIC,
+      (event) => that.athenaEegData(1, event)
     );
-    await this.#connectChar(
-      service,
-      this.#EEG3_CHARACTERISTIC,
-      function (event) {
-        that.eegData(2, event);
-      }
+    
+    const athenaChar3 = await connectCharAcrossServices(
+      this.#ATHENA_EEG3_CHARACTERISTIC,
+      (event) => that.athenaEegData(2, event)
     );
-    await this.#connectChar(
-      service,
-      this.#EEG4_CHARACTERISTIC,
-      function (event) {
-        that.eegData(3, event);
+    
+    // If Athena characteristics connected, we're on an Athena device
+    if (athenaChar1 || athenaChar2 || athenaChar3) {
+      this.#isAthena = true;
+      console.log("[web-muse] Detected Muse S Athena - using multiplexed EEG format");
+    } else {
+      // Fall back to legacy Muse EEG characteristics
+      console.log("[web-muse] Trying legacy Muse EEG characteristics...");
+      
+      await connectCharAcrossServices(
+        this.#EEG1_CHARACTERISTIC,
+        (event) => that.eegData(0, event)
+      );
+
+      await connectCharAcrossServices(
+        this.#EEG2_CHARACTERISTIC,
+        (event) => that.eegData(1, event)
+      );
+
+      await connectCharAcrossServices(
+        this.#EEG3_CHARACTERISTIC,
+        (event) => that.eegData(2, event)
+      );
+
+      await connectCharAcrossServices(
+        this.#EEG4_CHARACTERISTIC,
+        (event) => that.eegData(3, event)
+      );
+
+      await connectCharAcrossServices(
+        this.#EEG5_CHARACTERISTIC,
+        (event) => that.eegData(4, event)
+      );
+    }
+
+    // 221e Muse v3 TLV protocol characteristics (d5913036-... CMD, 09bf2c52-... DATA)
+    // stream IMU sensor data (accelerometer/gyroscope/magnetometer) in binary TLV
+    // format — NOT EEG data. If no Interaxon EEG characteristics were found, we
+    // cannot stream EEG from this device; log a diagnostic instead of mis-routing
+    // IMU packets to the EEG parser.
+    if (!this.#controlChar && !this.#isAthena) {
+      const hasLegacyEEG = this.eeg && this.eeg.some(buf => buf != null);
+      if (!hasLegacyEEG) {
+        console.warn(
+          "[web-muse] No Interaxon EEG characteristics found on any service. " +
+          "221e Muse v3 CMD/DATA characteristics stream IMU data (TLV binary), " +
+          "not EEG. This device may not support EEG streaming via Web Bluetooth."
+        );
       }
-    );
-    await this.#connectChar(
-      service,
-      this.#EEG5_CHARACTERISTIC,
-      function (event) {
-        that.eegData(4, event);
+    }
+
+    // Start streaming if control characteristic is available
+    if (this.#controlChar) {
+      console.log("[web-muse] Sending start commands via control characteristic...");
+      
+      if (this.#isAthena) {
+        // Muse S Athena protocol v7 - OpenMuse sequence
+        console.log("[web-muse] Trying Athena protocol v7 (OpenMuse) start sequence...");
+        
+        // 1. Version query
+        await this.#sendCommand("v6");
+        await this.#sleep(200);
+        
+        // 2. Status query
+        await this.#sendCommand("s");
+        await this.#sleep(200);
+        
+        // 3. Halt/reset
+        await this.#sendCommand("h");
+        await this.#sleep(200);
+        
+        // 4. Apply preset (p1041 for all channels)
+        await this.#sendCommand("p1041");
+        await this.#sleep(200);
+        
+        // 5. Query status after preset change
+        await this.#sendCommand("s");
+        await this.#sleep(200);
+        
+        // 6. START STREAMING - dc001 MUST be sent TWICE!
+        console.log("[web-muse] Sending dc001 (start streaming) twice...");
+        await this.#sendCommand("dc001");
+        await this.#sleep(50);
+        await this.#sendCommand("dc001");
+        await this.#sleep(100);
+        
+        // 7. Enable low-latency mode
+        await this.#sendCommand("L1");
+        await this.#sleep(300);
+        
+        // 8. Final status query
+        await this.#sendCommand("s");
+        await this.#sleep(200);
+        
+        console.log("[web-muse] Athena start commands sent");
+      } else {
+        await this.#start();
+        await this.#sendCommand("v1");
+        console.log("[web-muse] Start commands sent");
       }
-    );
-    await this.#start();
-    await this.#sendCommand("v1");
+    } else {
+      console.log("[web-muse] No control characteristic - device may stream automatically");
+    }
+
     this.#state = 2;
+    console.log("[web-muse] Connection complete, state:", this.#state);
+    
+    // Log which characteristics were connected
+    console.log("[web-muse] EEG buffers available:", this.eeg ? this.eeg.length : 0);
   }
 }
 
-/**
- * An interface for connecting with a Muse headband based on circular buffers of size 256.
- * Note: EEG data is mapped into the range [-1000, 1000).
- *
- * @extends MuseBase
- */
 export class Muse extends MuseBase {
-  /**
-   * Constructs a new instance of the Muse class.
-   *
-   * @constructor
-   * @param {Object} options - Configuration options
-   * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
-   * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
-   */
   constructor(options = {}) {
     super(options);
     const BUFFER_SIZE = 256;
@@ -695,63 +656,36 @@ export class Muse extends MuseBase {
       new MuseCircularBuffer(BUFFER_SIZE),
     ];
   }
-  /**
-   * Updates the battery level based on the received event.
-   *
-   * @param {Event} event - The event containing the battery data.
-   * @return {void} This function does not return a value.
-   */
+
   batteryData(event) {
     this.batteryLevel = this.eventBatteryData(event);
   }
-  /**
-   * Processes the accelerometer data from the given event.
-   *
-   * @param {Event} event - The event containing the accelerometer data.
-   * @return {void} This function does not return a value.
-   */
+
   accelerometerData(event) {
-    const vals = this.eventAccelerometerData(event);
-    for (let i = 0; i < 3; i++) {
-      this.accelerometer[0].write(vals[0][i]);
-      this.accelerometer[1].write(vals[1][i]);
-      this.accelerometer[2].write(vals[2][i]);
+    const samples = this.eventAccelerometerData(event);
+    for (let i = 0; i < samples[0].length; i++) {
+      this.accelerometer[0].write(samples[0][i]);
+      this.accelerometer[1].write(samples[1][i]);
+      this.accelerometer[2].write(samples[2][i]);
     }
   }
-  /**
-   * Processes the gyroscope data from the given event.
-   *
-   * @param {Event} event - The event containing the gyroscope data.
-   * @return {void} This function does not return a value.
-   */
+
   gyroscopeData(event) {
-    const vals = this.eventAccelerometerData(event);
-    for (let i = 0; i < 3; i++) {
-      this.gyroscope[0].write(vals[0][i]);
-      this.gyroscope[1].write(vals[1][i]);
-      this.gyroscope[2].write(vals[2][i]);
+    const samples = this.eventGyroscopeData(event);
+    for (let i = 0; i < samples[0].length; i++) {
+      this.gyroscope[0].write(samples[0][i]);
+      this.gyroscope[1].write(samples[1][i]);
+      this.gyroscope[2].write(samples[2][i]);
     }
   }
-  /**
-   * A function that processes control data from the given event.
-   *
-   * @param {Event} event - The event containing the control data.
-   * @return {void} This function does not return a value.
-   */
+
   controlData(event) {
-    const tmp = this.eventControlData(event);
-    for (const key in tmp) {
-      this.info[key] = tmp[key];
+    const info = this.eventControlData(event);
+    for (const key in info) {
+      this.info[key] = info[key];
     }
   }
-  /**
-   * Processes EEG data from the given event, scales it to the range [-1000, 1000),
-   * and writes it to the corresponding PPG circular buffer.
-   *
-   * @param {number} n - The index of the EEG channel.
-   * @param {Event} event - The event containing the EEG data.
-   * @return {void} This function does not return a value.
-   */
+
   eegData(n, event) {
     let samples = this.eventEEGData(event);
     samples = samples.map(function (x) {
@@ -761,13 +695,176 @@ export class Muse extends MuseBase {
       this.eeg[n].write(samples[i]);
     }
   }
-  /**
-   * Processes PPG data received from the event and writes it to the corresponding PPG circular buffer.
-   *
-   * @param {number} n - The index of the PPG circular buffer to write to.
-   * @param {Event} event - The event containing the PPG data.
-   * @return {void} This function does not return a value.
-   */
+
+  athenaEegData(charIndex, event) {
+    // Muse S Athena uses multiplexed binary format (OpenMuse protocol)
+    // Packets have 14-byte headers followed by sensor subpackets
+    let data = event.target.value;
+    data = data.buffer ? data : new DataView(data);
+    const bytes = new Uint8Array(data.buffer);
+    
+    // Log first few packets to understand format
+    if (!this._athenaLogCount) this._athenaLogCount = 0;
+    if (this._athenaLogCount < 3) {
+      console.log(`[web-muse] Athena char ${charIndex}: ${bytes.length} bytes, first 30:`, 
+        Array.from(bytes.slice(0, 30)).map(b => b.toString(16).padStart(2, '0')).join(' '));
+      this._athenaLogCount++;
+    }
+    
+    // Sensor data lengths (from OpenMuse protocol)
+    const SENSOR_DATA_LEN = {
+      0x11: 28,  // EEG 4ch x 4samples
+      0x12: 28,  // EEG 8ch x 2samples
+      0x34: 30,  // OPTICS 4ch
+      0x35: 40,  // OPTICS 8ch
+      0x36: 40,  // OPTICS 16ch
+      0x47: 36,  // ACCGYRO
+      0x53: 24,  // Unknown
+      0x88: 188, // Battery (new)
+      0x98: 20,  // Battery (old)
+    };
+    
+    // Parse all packets in the message
+    let pktOffset = 0;
+    while (pktOffset < bytes.length) {
+      const pktLen = bytes[pktOffset];
+      if (pktLen < 14 || pktOffset + pktLen > bytes.length) break;
+      
+      const pktData = bytes.subarray(pktOffset, pktOffset + pktLen);
+      const pktId = pktData[9]; // Primary sensor TAG
+      
+      // Data section starts after 14-byte header
+      let dataOffset = 14;
+      
+      // First subpacket uses pktId as its type (no TAG byte)
+      const firstDataLen = SENSOR_DATA_LEN[pktId] || 0;
+      if (pktId === 0x11 || pktId === 0x12) {
+        if (dataOffset + firstDataLen <= pktData.length) {
+          this.#parseAthenaEegSubpacket(pktId, pktData.subarray(dataOffset, dataOffset + firstDataLen));
+        }
+      } else if (pktId === 0x88 || pktId === 0x98) {
+        if (dataOffset + firstDataLen <= pktData.length) {
+          this._parseAthenaBatterySubpacket(pktId, pktData.subarray(dataOffset, dataOffset + firstDataLen));
+        }
+      }
+      dataOffset += firstDataLen;
+      
+      // Additional subpackets have [TAG (1 byte)][header (4 bytes)][data]
+      while (dataOffset + 5 < pktData.length) {
+        const tag = pktData[dataOffset];
+        const subDataLen = SENSOR_DATA_LEN[tag];
+        if (!subDataLen) break;
+        
+        const subStart = dataOffset + 5; // Skip TAG + 4-byte header
+        const subEnd = subStart + subDataLen;
+        
+        if (subEnd > pktData.length) break;
+        
+        if (tag === 0x11 || tag === 0x12) {
+          this.#parseAthenaEegSubpacket(tag, pktData.subarray(subStart, subEnd));
+        } else if (tag === 0x88 || tag === 0x98) {
+          this._parseAthenaBatterySubpacket(tag, pktData.subarray(subStart, subEnd));
+        }
+        
+        dataOffset = subEnd;
+      }
+      
+      pktOffset += pktLen;
+    }
+  }
+  
+  #parseAthenaEegSubpacket(tag, dataBytes) {
+    // EEG data is 14-bit values packed
+    // TAG 0x11: 4 channels x 4 samples = 16 values in 28 bytes
+    // TAG 0x12: 8 channels x 2 samples = 16 values in 28 bytes
+    const EEG_SCALE = 1450.0 / 16383.0; // Convert to microvolts
+    
+    const nChannels = (tag === 0x11) ? 4 : 8;
+    const nSamples = (tag === 0x11) ? 4 : 2;
+    
+    if (dataBytes.length < 28) return;
+    
+    // Debug: log first EEG subpacket found
+    if (!this._eegSubpacketLogged) {
+      this._eegSubpacketLogged = true;
+      console.log(`[web-muse] Found EEG subpacket TAG=0x${tag.toString(16)}, ${nChannels}ch x ${nSamples}samples, ${dataBytes.length} bytes`);
+    }
+    
+    // Parse 14-bit packed values (7 bytes per 4 samples)
+    const values = this.#decode14BitData(dataBytes);
+    
+    // Organize into channels - values are interleaved by channel
+    for (let s = 0; s < nSamples; s++) {
+      for (let ch = 0; ch < Math.min(nChannels, 4); ch++) {
+        const idx = s * nChannels + ch;
+        if (idx < values.length && ch < this.eeg.length) {
+          // Convert from 14-bit to microvolts
+          const uV = (values[idx] - 8192) * EEG_SCALE;
+          this.eeg[ch].write(uV);
+        }
+      }
+    }
+  }
+  
+  _parseAthenaBatterySubpacket(tag, dataBytes) {
+    const dv = new DataView(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength);
+
+    if (tag === 0x98 && dataBytes.length >= 4) {
+      const level = dv.getUint16(2) / 512;
+      if (level >= 0 && level <= 100) {
+        this.batteryLevel = Math.round(level);
+      }
+      if (!this._batteryLogged) {
+        this._batteryLogged = true;
+        console.log(`[web-muse] Athena battery (0x98): ${this.batteryLevel}%`,
+          `raw first 10 bytes:`, Array.from(dataBytes.slice(0, 10)).map(b => b.toString(16).padStart(2, '0')).join(' '));
+      }
+    } else if (tag === 0x88 && dataBytes.length >= 4) {
+      const level = dv.getUint16(2) / 512;
+      if (level >= 0 && level <= 100) {
+        this.batteryLevel = Math.round(level);
+      }
+      if (!this._batteryLogged) {
+        this._batteryLogged = true;
+        const rawHex = Array.from(dataBytes.slice(0, 30)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+        console.log(`[web-muse] Athena battery (0x88): level=${this.batteryLevel}%, ${dataBytes.length} bytes`);
+        console.log(`[web-muse] Battery raw: ${rawHex}`);
+        if (this.batteryLevel === null || this.batteryLevel === 0) {
+          console.log(`[web-muse] Battery parse may need adjustment. uint16 candidates:`,
+            `@0=${dv.getUint16(0)}`, `@2=${dv.getUint16(2)}`, `@4=${dv.getUint16(4)}`,
+            `@6=${dv.getUint16(6)}`, `@8=${dv.getUint16(8)}`);
+        }
+      }
+    }
+  }
+
+  #decode14BitData(bytes) {
+    // Decode packed 14-bit values (4 values per 7 bytes)
+    const values = [];
+    for (let i = 0; i + 6 < bytes.length; i += 7) {
+      // 4 x 14-bit values packed in 7 bytes
+      values.push(((bytes[i] << 6) | (bytes[i+1] >> 2)) & 0x3FFF);
+      values.push((((bytes[i+1] & 0x03) << 12) | (bytes[i+2] << 4) | (bytes[i+3] >> 4)) & 0x3FFF);
+      values.push((((bytes[i+3] & 0x0F) << 10) | (bytes[i+4] << 2) | (bytes[i+5] >> 6)) & 0x3FFF);
+      values.push((((bytes[i+5] & 0x3F) << 8) | bytes[i+6]) & 0x3FFF);
+    }
+    return values;
+  }
+
+  // Public version of decode for use in athenaEegData
+  #decodeUnsigned12BitDataPublic(samples) {
+    const samples12Bit = [];
+    for (let i = 0; i < samples.length; i++) {
+      if (i % 3 === 0) {
+        samples12Bit.push((samples[i] << 4) | (samples[i + 1] >> 4));
+      } else {
+        samples12Bit.push(((samples[i] & 0xf) << 8) | samples[i + 1]);
+        i++;
+      }
+    }
+    return samples12Bit;
+  }
+
   ppgData(n, event) {
     const samples = this.eventPPGData(event);
     for (let i = 0; i < samples.length; i++) {
@@ -776,22 +873,14 @@ export class Muse extends MuseBase {
   }
 }
 
-/**
- * Connects to a Muse device and returns the connected Muse object.
- *
- * @param {Object} options - Configuration options
- * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
- * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
- * @return {Muse} The connected Muse object.
- */
 export const connectMuse = async (options = {}) => {
   const muse = new Muse(options);
   if (options.mock) {
-    console.log("Attempting to connect to Muse in mock mode...");
+    console.log("[web-muse] Connecting in mock mode...");
   } else {
-    console.log("Attempting to connect to Muse...");
+    console.log("[web-muse] Connecting to Muse device...");
   }
   await muse.connect();
-  console.log("Muse connected:", muse);
+  console.log("[web-muse] Connected:", muse.state === 2);
   return muse;
 };
