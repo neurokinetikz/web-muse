@@ -292,14 +292,37 @@ The library is built around two main classes:
 | `connect()`    | Connect to device (or start mock mode)             |
 | `disconnect()` | Disconnect from device and stop data streaming     |
 
+## Running the Examples
+
+Both examples work without a physical Muse device — use the **Mock Data** button to stream pre-recorded EEG data.
+
+### Vanilla Example
+
+A minimal HTML/JS app showing real-time EEG channel values with no framework dependencies.
+
+```bash
+npm run example:vanilla
+```
+
+Opens on `http://localhost:5173`. Displays all 5 EEG channels, battery level, and device info.
+
+### React Example
+
+A full React app with live EEG chart visualization (Recharts), recording, and frequency band analysis.
+
+```bash
+npm run example:react
+```
+
+Opens on `http://localhost:3000`. Includes connect/disconnect, mock mode, recording with power spectrum results.
+
+> Both commands auto-install example dependencies on first run.
+
 ## Development
 
 ```bash
 # Install dependencies
 npm install
-
-# Run example
-npm run dev
 
 # Build library
 npm run build
