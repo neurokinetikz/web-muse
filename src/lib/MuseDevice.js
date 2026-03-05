@@ -780,34 +780,55 @@ export class Muse extends MuseBase {
     }
   }
   
-  #parseAthenaEegSubpacket(tag, dataBytes) {
-    // EEG data is 14-bit values packed
-    // TAG 0x11: 4 channels x 4 samples = 16 values in 28 bytes
-    // TAG 0x12: 8 channels x 2 samples = 16 values in 28 bytes
-    const EEG_SCALE = 1450.0 / 16383.0; // Convert to microvolts
-    
+ #parseAthenaEegSubpacket(tag, dataBytes) {
+    const EEG_SCALE = 1450.0 / 16383.0; 
     const nChannels = (tag === 0x11) ? 4 : 8;
     const nSamples = (tag === 0x11) ? 4 : 2;
     
     if (dataBytes.length < 28) return;
     
-    // Debug: log first EEG subpacket found
-    if (!this._eegSubpacketLogged) {
-      this._eegSubpacketLogged = true;
-      console.log(`[web-muse] Found EEG subpacket TAG=0x${tag.toString(16)}, ${nChannels}ch x ${nSamples}samples, ${dataBytes.length} bytes`);
+    // Initialize DSP filters for each channel if they don't exist
+    if (!this._dsp) {
+      this._dsp = Array(8).fill(0).map(() => ({
+        x1: 0, x2: 0, y1: 0, y2: 0, // 60Hz Notch State
+        dcX: 0, dcY: 0              // DC Blocker State
+      }));
     }
     
-    // Parse 14-bit packed values (7 bytes per 4 samples)
     const values = this.#decode14BitData(dataBytes);
     
-    // Organize into channels - values are interleaved by channel
     for (let s = 0; s < nSamples; s++) {
       for (let ch = 0; ch < Math.min(nChannels, 4); ch++) {
         const idx = s * nChannels + ch;
         if (idx < values.length && ch < this.eeg.length) {
-          // Convert from 14-bit to microvolts
-          const uV = (values[idx] - 8192) * EEG_SCALE;
-          this.eeg[ch].write(uV);
+          
+          // 1. Raw scaled microvolts
+          const raw_uV = (values[idx] - 8192) * EEG_SCALE;
+          const st = this._dsp[ch];
+          
+          // Step initialization to prevent massive startup ringing
+          if (st.x1 === 0 && st.x2 === 0) {
+              st.x1 = raw_uV; st.x2 = raw_uV;
+              st.y1 = raw_uV; st.y2 = raw_uV;
+              st.dcX = raw_uV;
+          }
+          
+          // 2. 60Hz Notch Filter (Fs=256Hz, Q=30)
+          const b0 = 0.983684, b1 = -0.192835, b2 = 0.983684;
+          const a1 = -0.192835, a2 = 0.967369;
+          
+          const notch_y = b0 * raw_uV + b1 * st.x1 + b2 * st.x2 - a1 * st.y1 - a2 * st.y2;
+          
+          st.x2 = st.x1; st.x1 = raw_uV;
+          st.y2 = st.y1; st.y1 = notch_y;
+          
+          // 3. DC Blocker (High Pass, cutoff ~0.4Hz) to remove skin drift
+          const clean_y = notch_y - st.dcX + 0.99 * st.dcY;
+          
+          st.dcX = notch_y;
+          st.dcY = clean_y;
+
+          this.eeg[ch].write(clean_y);
         }
       }
     }
@@ -846,14 +867,14 @@ export class Muse extends MuseBase {
   }
 
   #decode14BitData(bytes) {
-    // Decode packed 14-bit values (4 values per 7 bytes)
+    // Neurovis Patch: 14-bit Little-Endian (LSB) unpacker
     const values = [];
     for (let i = 0; i + 6 < bytes.length; i += 7) {
-      // 4 x 14-bit values packed in 7 bytes
-      values.push(((bytes[i] << 6) | (bytes[i+1] >> 2)) & 0x3FFF);
-      values.push((((bytes[i+1] & 0x03) << 12) | (bytes[i+2] << 4) | (bytes[i+3] >> 4)) & 0x3FFF);
-      values.push((((bytes[i+3] & 0x0F) << 10) | (bytes[i+4] << 2) | (bytes[i+5] >> 6)) & 0x3FFF);
-      values.push((((bytes[i+5] & 0x3F) << 8) | bytes[i+6]) & 0x3FFF);
+      // 4 x 14-bit values packed in 7 bytes, Little-Endian orientation
+      values.push((bytes[i] | ((bytes[i+1] & 0x3F) << 8)) & 0x3FFF);
+      values.push(((bytes[i+1] >> 6) | (bytes[i+2] << 2) | ((bytes[i+3] & 0x0F) << 10)) & 0x3FFF);
+      values.push(((bytes[i+3] >> 4) | (bytes[i+4] << 4) | ((bytes[i+5] & 0x03) << 12)) & 0x3FFF);
+      values.push(((bytes[i+5] >> 2) | (bytes[i+6] << 6)) & 0x3FFF);
     }
     return values;
   }
